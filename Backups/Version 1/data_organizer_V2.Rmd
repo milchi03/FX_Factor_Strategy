@@ -1,0 +1,127 @@
+---
+title: "data_organizer"
+author: "Maximilian Michlits"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+Library Manager
+```{r, include = FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(readxl)
+library(quantmod)
+```
+
+
+Forward and Spot Rates
+```{r}
+# Load the data
+fx_spots_and_6m_forwards <- read_xlsx("./Data/fx_spots_and_6m_forwards.xlsx")
+
+# Transform forwards in bpts to forwards in absolute change (6m carry)
+fx_spots_and_6m_forwards <- fx_spots_and_6m_forwards %>%
+  mutate(across(ends_with(".forward_bpts_6m"), ~ . / 1000))
+
+# Prepare
+currencies <- unique(substr(colnames(fx_spots_and_6m_forwards), 1, 3))
+tmp_storage <- list()
+
+# Loop through each currency and subset the corresponding columns
+for (currency in currencies) {
+  currency_df <- fx_spots_and_6m_forwards %>%
+    select(starts_with(currency))
+  
+  spots <- currency_df[c(1, 2)]
+  spots <- na.omit(spots)
+  forwards <- currency_df[c(3, 4)]
+  forwards <- na.omit(forwards)
+  
+  colnames(spots) <- c("date", "spot")
+  colnames(forwards) <- c("date", "forward_bpts_6m")
+  
+  currency_df <- inner_join(x = spots, y = forwards, by = "date")
+  currency_df <- data.frame(currency = rep(currency, nrow(currency_df)), currency_df)
+  
+  tmp_storage[[currency]] <- currency_df
+}
+
+# Combine all data frames in the list into one long data frame
+fx_spots_and_6m_forwards <- bind_rows(tmp_storage)
+
+#Save
+save(fx_spots_and_6m_forwards, file = "./Data/fx_spots_and_6m_forwards.RData")
+
+
+#Clean up
+rm(currency_df, forwards, spots, tmp_storage,
+   currencies, currency)
+```
+
+VIX
+```{r}
+#load VIX data
+VIX <- read_xlsx("./Data/VIX.xlsx")
+#adjust it to decimal terms
+VIX$VIX.Price <-  VIX$VIX.Price/100
+#organize
+colnames(VIX) <- c("Date","VIX_value")
+#save
+save(VIX, file = "./Data/VIX.RData")
+```
+
+Return Data
+```{r}
+# Load the data
+fx_spots <- read_xlsx("./Data/fx_spots_and_6m_forwards.xlsx")
+
+# Prepare
+currencies <- unique(substr(colnames(fx_spots), 1, 3))
+tmp_storage <- list()
+
+# Loop through each currency and subset the corresponding columns
+for (currency in currencies) {
+  currency_df <- fx_spots %>%
+    select(starts_with(currency))
+  
+  spots <- currency_df[c(1, 2)]
+  spots <- na.omit(spots)
+  
+  colnames(spots) <- c("date", "spot")
+  currency_df <- data.frame(currency = rep(currency, nrow(spots)), spots)
+  
+  tmp_storage[[currency]] <- currency_df
+}
+
+# Combine all data frames in the list into one long data frame
+fx_spots <- bind_rows(tmp_storage)
+
+# Compute log returns
+fx_log_returns <- fx_spots %>%
+  group_by(currency) %>%
+  arrange(date) %>%
+  mutate(log_return = c(NA, diff(log(spot))))
+fx_log_returns <- fx_log_returns %>%
+  select(1,2,4)
+
+#Make sure you don't omit too much and drop NAs
+sum(is.na(fx_log_returns$log_return))
+fx_log_returns <- na.omit(fx_log_returns)
+
+#Resolve some issue regarding structure
+fx_log_returns <- as_tibble(fx_log_returns)
+
+#save
+save(fx_log_returns, file = "./Data/fx_log_returns.RData")
+
+#Clean up
+rm(currency_df, spots, tmp_storage, fx_spots,
+   currencies, currency)
+```
+
+Clean up
+```{r}
+rm(list = ls())
+```

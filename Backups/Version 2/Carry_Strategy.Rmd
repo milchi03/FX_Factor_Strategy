@@ -1,0 +1,285 @@
+---
+title: "Carry_Strategy"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "r Sys.Date()"
+output: html_document
+---
+
+To Do's:
+Set up proper data loading
+Inlcude 3 factors that Simion sent (in icloud -> Studium -> Simion, Giorgia "Questions")
+
+
+
+Starting off by loading libraries and the data.
+```{r, include = FALSE}
+#load libraries
+library(dplyr) # general use
+library(forecast) # for autoregression models
+
+#Debug T = on/ F = off
+DEBUG <- FALSE
+```
+
+We want to calculate the carry of each currency. The Carry $C$, of currency $i$ against USD, at time $t$ and horizon $h\in (0,12)$ in months (the time span into the future for the forward) can be computed as follows: $C_{i_t}^h=Forward_{i_t}^h-Spot_{i_t}^h$
+
+Luckily this is the same as forward spreads which is the standard way of downloading forward data via Bloomberg. Therefore, no further calculations are necessary to find carry.
+
+I use monthly data for the following to reduce noise and speed up computation time. This methodology is further validated by application constraints, as reallocating more often results in extremly high trading costs.
+
+Other factors we load are:
+liquidity = (bid-ask) / ((bid+ask)/2), capturing relative spread relative to price.
+VIX, which is the implied volatility of the S&P500 for one year, basically markets anticipation of risk for the next year.
+```{r}
+#load data sets.
+load("./Data/fx_log_returns.RData")
+load("./Data/fx_carry.RData")
+load("./Data/fx_liquidity.RData")
+load("./Data/vix.RData")
+
+#Merge Datasets
+fx_factors <- left_join(x = fx_log_returns, y = fx_carry, by = join_by(currency, date))
+fx_factors <- left_join(x = fx_factors, y = fx_liquidity, by = join_by(currency, date))
+fx_factors <- left_join(x = fx_factors, y = vix, by = "date")
+
+#display df
+# Display the first and last 50 rows of fx_log_returns
+head(fx_factors, 50) %>% 
+  knitr::kable()
+tail(fx_factors, 50) %>% 
+  knitr::kable()
+
+# Clean up!
+if (DEBUG != TRUE) {
+  rm(fx_carry, fx_liquidity, fx_log_returns, vix)
+}
+```
+
+#Buildering linear models
+We use linear models to try predicting log_returns in currency markets.
+
+##Defining functions for generating and analyzing linear models
+We use this function to generate all model combinations for a list of dependend and independent variables.
+```{r}
+# Function to generate all combinations of independent variables and dependent variables
+generate_model_combinations <- function(dependent_var, independent_vars, subset_models = NA) {
+  # Initialize an empty list to store model formulas
+  model_combinations <- list()
+  
+  # If subset_models is not NA, apply the provided conditions
+  if (!is.na(subset_models[1])) {
+    for (subset in subset_models) {
+      # Split the subset string to get the independent variables and condition
+      subset_parts <- unlist(strsplit(subset, "_"))
+      
+      # The last part is the condition (e.g., "JPY"), and the rest are the independent variables
+      condition <- subset_parts[length(subset_parts)]
+      
+      # Generate all combinations of independent variables for each subset
+      for (i in 1:length(independent_vars)) {
+        combos <- combn(independent_vars, i, simplify = FALSE)
+        
+        # For each combination, create the model name and formula with the subset condition
+        for (combo in combos) {
+          # Create a model name (e.g., "lm_log_return_carry_liquidity_JPY")
+          model_name <- paste("lm", dependent_var, paste(combo, collapse = "_"), condition, sep = "_")
+          
+          # Create a formula string that applies the condition to both dependent and independent variables
+          dependent_string <- paste(dependent_var, "[currency == '", condition, "']", sep = "")
+          independent_string <- paste(lapply(combo, function(var) paste(var, "[currency == '", condition, "']", sep = "")), collapse = " + ")
+          
+          # Combine into a formula string
+          formula_string <- paste(dependent_string, "~", independent_string)
+          
+          # Add the formula string to the list
+          model_combinations[[model_name]] <- formula_string
+        }
+      }
+    }
+  } else {
+    # If subset_models is NA, generate all combinations of independent variables without a condition
+    for (i in 1:length(independent_vars)) {
+      # Get all combinations of i independent variables
+      combos <- combn(independent_vars, i, simplify = FALSE)
+      
+      # For each combination, create the formula and model name
+      for (combo in combos) {
+        # Create a model name (e.g., "lm_dependent_carry_liquidity")
+        model_name <- paste("lm", dependent_var, paste(combo, collapse = "_"), sep = "_")
+        
+        # Create a formula string (e.g., "dependent_var ~ carry + liquidity")
+        formula_string <- paste(dependent_var, "~", paste(combo, collapse = " + "))
+        
+        # Add the formula string to the list
+        model_combinations[[model_name]] <- formula_string
+      }
+    }
+  }
+  
+  return(model_combinations)
+}
+```
+
+To run all the models in a list (the returned object of generate_model_combinations) we define a function that runs all models in a list of model-formulas.
+```{r}
+fit_models <- function(models = list(), data = NA) {
+  # Initialize an empty list to store the fitted models
+  model_list <- list()
+  
+  # Loop through each model in model_combinations
+  for (model_name in names(model_combinations)) {
+    # Get the formula as a string
+    formula_string <- model_combinations[[model_name]]
+    
+    # Fit the linear model using the formula and the provided dataset
+    model <- lm(as.formula(formula_string), data = data)
+    
+    # Store the fitted model in the list
+    model_list[[model_name]] <- model
+  }
+  
+  # Return the list of fitted models
+  return(model_list)
+}
+```
+
+And a function that saves diagnostic plots in folders for a list of models.
+```{r}
+save_model_diagnostics <- function(model_list, main_dir = "model_diagnostics", subset_names = NA) {
+  # Create the main directory if it doesn't exist
+  if (!dir.exists(main_dir)) {
+    dir.create(main_dir)
+  }
+  
+  # Check if we are using currency-specific models or pooled models
+  if (!is.na(subset_names[1])) {
+    # Loop over each subset in the subset_names list (e.g., "JPY", "USD")
+    for (subset in subset_names) {
+      # Create a subdirectory for each subset (e.g., "JPY_models", "USD_models")
+      sub_dir <- paste0(subset, "_models")
+      output_dir <- file.path(main_dir, sub_dir)
+      
+      # Create the subdirectory if it doesn't exist
+      if (!dir.exists(output_dir)) {
+        dir.create(output_dir, recursive = TRUE)
+      }
+      
+      # Now generate diagnostic plots only for models that match the current subset (currency)
+      for (model_name in names(model_list)) {
+        # Check if the model name ends with the current subset (e.g., "JPY", "USD")
+        if (grepl(paste0("_", subset, "$"), model_name)) {
+          # Extract the linear model
+          model <- model_list[[model_name]]
+          
+          # Define the file name for the diagnostic plots
+          file_name <- file.path(output_dir, paste0(model_name, "_diagnostics.png"))
+          
+          # Open a new PNG device
+          png(file_name, width = 1200, height = 1200)
+          
+          # Set a proper plot layout
+          par(mfrow = c(3, 2))
+          
+          # Plot the model diagnostics
+          plot(model, main = paste("Diagnostic plots for", model_name))
+          
+          # Plot the autocorrelation function of residuals
+          acf(residuals(model), main = paste("ACF of Residuals for", model_name))
+          
+          # Close the PNG device
+          dev.off()
+          
+          print(paste("Saved diagnostic plots for", model_name, "to", file_name))
+        }
+      }
+    }
+  } else {
+    # Case when subset_names is NA (pooled data)
+    # Create a pooled directory
+    pooled_dir <- file.path(main_dir, "pooled_models")
+    
+    if (!dir.exists(pooled_dir)) {
+      dir.create(pooled_dir)
+    }
+    
+    # Generate diagnostic plots for pooled models
+    for (model_name in names(model_list)) {
+      # Extract the linear model
+      model <- model_list[[model_name]]
+      
+      # Define the file name for the diagnostic plots
+      file_name <- file.path(pooled_dir, paste0(model_name, "_diagnostics.png"))
+      
+      # Open a new PNG device
+      png(file_name, width = 1200, height = 1200)
+      
+      # Set a proper plot layout
+      par(mfrow = c(3, 2))
+      
+      # Plot the model diagnostics
+      plot(model, main = paste("Diagnostic plots for", model_name))
+      
+      # Plot the autocorrelation function of residuals
+      acf(residuals(model), main = paste("ACF of Residuals for", model_name))
+      
+      # Close the PNG device
+      dev.off()
+      
+      print(paste("Saved diagnostic plots for", model_name, "to", file_name))
+    }
+  }
+  
+  # Reset the plotting layout back to default (1x1)
+  par(mfrow = c(1, 1))
+}
+
+```
+
+##Setting Parameters
+```{r}
+dependent_var <- c("log_return")
+independent_vars <- c("carry", "liquidity", "vix_level")
+```
+
+###Pooled currency models
+We can now run the pooled currency models and save them
+```{r}
+#We get our combinations
+model_combinations <- generate_model_combinations(dependent_var, independent_vars)
+
+#Fit the models
+model_list_pooled <- fit_models(models = model_combinations,
+                                data = fx_factors)
+
+#And save the plots
+main_dir <- "model_diagnostics"
+save_model_diagnostics(model_list = model_list_pooled,
+                       main_dir = main_dir)
+```
+
+###Currency specific models
+As we can see, due to the large number of currencies and some individual properties we cannot assume ???. To resolve this we try running currency specific models and analyze the residuals.
+```{r}
+#We get our combinations
+model_combinations <- generate_model_combinations(dependent_var,
+                                                  independent_vars,
+                                                  subset_models = unique(fx_factors$currency))
+#Fit the models
+model_list_currency_specific <- fit_models(models = model_combinations, 
+                                           data = fx_factors)
+
+#And save the plots
+save_model_diagnostics(model_list = model_list_currency_specific,
+                       main_dir = main_dir,
+                       subset_names = unique(fx_factors$currency))
+```
+
+```{r}
+
+```
+
+```{r}
+
+```

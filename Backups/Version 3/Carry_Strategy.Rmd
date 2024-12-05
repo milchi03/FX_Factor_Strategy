@@ -1,0 +1,185 @@
+---
+title: "Carry_Strategy"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "r Sys.Date()"
+output: html_document
+---
+
+To Do's:
+Set up proper data loading
+Inlcude 3 factors that Simion sent (in icloud -> Studium -> Simion, Giorgia "Questions")
+Statistical interactions
+
+
+Starting off by loading libraries and the data.
+```{r, include = FALSE}
+#load libraries
+library(dplyr) # general use
+library(forecast) # for autoregression models
+
+#Debug T = on/ F = off
+DEBUG <- FALSE
+```
+
+We want to calculate the carry of each currency. The Carry $C$, of currency $i$ against USD, at time $t$ and horizon $h\in (0,12)$ in months (the time span into the future for the forward) can be computed as follows: $C_{i_t}^h=Forward_{i_t}^h-Spot_{i_t}^h$
+
+Luckily this is the same as forward spreads which is the standard way of downloading forward data via Bloomberg. Therefore, no further calculations are necessary to find carry.
+
+I use monthly data for the following to reduce noise and speed up computation time. This methodology is further validated by application constraints, as reallocating more often results in extremly high trading costs.
+
+Other factors we load are:
+liquidity = (bid-ask) / ((bid+ask)/2), capturing relative spread relative to price.
+VIX, which is the implied volatility of the S&P500 for one year, basically markets anticipation of risk for the next year.
+```{r}
+#load data sets.
+load("./Data/fx_log_returns.RData")
+load("./Data/fx_carry.RData")
+load("./Data/fx_liquidity.RData")
+load("./Data/vix.RData")
+
+#Merge Datasets
+fx_factors <- left_join(x = fx_log_returns, y = fx_carry, by = join_by(currency, date))
+fx_factors <- left_join(x = fx_factors, y = fx_liquidity, by = join_by(currency, date))
+fx_factors <- left_join(x = fx_factors, y = vix, by = "date")
+
+#display df
+# Display the first and last 50 rows of fx_log_returns
+head(fx_factors, 50) %>% 
+  knitr::kable()
+tail(fx_factors, 50) %>% 
+  knitr::kable()
+
+# Clean up!
+if (DEBUG != TRUE) {
+  rm(fx_carry, fx_liquidity, fx_log_returns, vix)
+}
+```
+
+#Building models
+We try out different models and compare them via statistical tests.
+
+##The interactions model
+We use linear models to try predicting log_returns in currency markets.
+
+This function helps us to save diagnostic plots in folders for a model.
+```{r}
+save_model_diagnostics <- function(model, main_dir = "model_diagnostics") {
+  # Automatically set model_name to the name of the variable passed to `model`
+  model_name <- deparse(substitute(model))
+  
+  # Create the main directory if it doesn't exist
+  if (!dir.exists(main_dir)) {
+    dir.create(main_dir)
+  }
+  
+  # Create a subdirectory for the specific model
+  model_dir <- file.path(main_dir, model_name)
+  if (!dir.exists(model_dir)) {
+    dir.create(model_dir)
+  }
+  
+  file_name_pattern <- file.path(model_dir, paste0(model_name, "_diagnostics"))
+  
+  # Open a new PNG device for plotting and set PNG device up
+  png(paste0(file_name_pattern, ".png"), width = 2000, height = 2000, res = 150)
+  par(mfrow = c(3, 2))  # Set layout for 6 plots: 4 diagnostics, ACF, coefficients
+  
+  # 4 base diagnostic plots, ACF
+  plot(model, main = paste("Diagnostic plots for", model_name))
+  acf(residuals(model), main = paste("ACF of Residuals for", model_name))
+
+  # Close the PNG device and reset layout
+  dev.off()
+  par(mfrow = c(1, 1))
+  print(sprintf("Saved diagnostic plots for %s to folder: %s", model_name, model_dir))
+}
+
+```
+
+Now we run the interactions model.
+```{r}
+#Setting Parameters
+main_dir <- "model_diagnostics"
+
+#Run models on different data sets
+#All currencies
+LR_int_all <- lm(formula = log_return ~ (carry + liquidity + vix_level)*currency, data = fx_factors)
+save_model_diagnostics(model = LR_int_all,
+                       main_dir = main_dir)
+#summary(LR_int_all)
+
+#DM currencies
+fx_factors_DM <- fx_factors %>%
+  filter(currency %in% c("EUR", "AUD", "JPY", "GBP", "CAD", "CHF", "NOK", "NZD", "SEK"))
+LR_int_DM <- lm(formula = log_return ~ (carry + liquidity + vix_level)*currency, data = fx_factors_DM)
+save_model_diagnostics(model = LR_int_DM,
+                       main_dir = main_dir)
+#summary(LR_int_DM)
+
+#DM_S-Tier currencies
+fx_factors_DM_S_Tier <- fx_factors %>%
+  filter(currency %in% c("EUR", "AUD", "JPY", "GBP", "CAD", "CHF"))
+LR_int_DM_S_Tier <- lm(formula = log_return ~ (carry + liquidity + vix_level)*currency, data = fx_factors_DM)
+save_model_diagnostics(model = LR_int_DM_S_Tier,
+                       main_dir = main_dir)
+summary(LR_int_DM_S_Tier)
+
+```
+
+##Backtesting for interactions model
+```{r}
+intervall_interactions_model <- function(model_formula, data, max_date){
+  
+  #seperate the data
+  training_data <- data %>%
+    filter(date < max_date)
+  testing_data <- data %>%
+    filter(date == max_date)
+  
+  #generate a model and let it predict the testing data
+  model <- lm(as.formula(model_formula) , data = training_data) 
+  testing_data$predicted_values <- predict(model, newdata = testing_data)
+  
+  return(testing_data)
+}
+
+single_return_simulation <- function(testing_data, n){
+  #number of long/short positions (example: n=2 means 2 long, 2 short) 
+  # Get the top n currencies with the largest predicted log returns
+  top_n_largest <- testing_data %>%
+    ungroup() %>%  # Remove any grouping that might exist
+    arrange(desc(predicted_values)) %>%
+    slice_head(n = n)
+  top_n_smallest <- testing_data %>%
+    ungroup() %>%  # Remove any grouping that might exist
+    arrange(predicted_values) %>% #by default ascending
+    slice_head(n = n)
+  
+  #IMPLEMENT WEIGHTING SCEMES LATER ON FOR NOW 1/n
+  return(sum(top_n_largest$log_return)-sum(top_n_smallest$log_return))
+}
+
+
+#Finally we generate the time series
+#Set parameters
+n <- 2 #number of long/short positions (example: n=2 means 2 long, 2 short) 
+model_formula <- "log_return ~ (carry + liquidity + vix_level)*currency"
+data <- fx_factors_DM_S_Tier
+simulation_time_series <- data.frame(date = unique(data$date), log_return = NA)
+
+for(date_index in 12:nrow(simulation_time_series) ){
+  date <- simulation_time_series$date[date_index]
+  simulation_time_series$log_return[date_index] <- single_return_simulation(testing_data = intervall_interactions_model(model_formula = model_formula, data = data, max_date = date), n = n)
+}
+
+```
+
+```{r}
+model = LR_int_DM_S_Tier
+training_and_testing_data <- fx_factors_DM_S_Tier %>%
+  filter(as.Date(date) >= as.Date("2010-01-01") & as.Date(date) < as.Date("2020-01-01"))
+  model_formula <- "log_return ~ (carry + liquidity + vix_level)*currency"
+
+```

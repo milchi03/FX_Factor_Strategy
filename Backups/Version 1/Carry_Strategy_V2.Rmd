@@ -1,0 +1,124 @@
+---
+title: "Carry_Strategy"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+Starting off by loading libraries and the data. Instead of the S&P500, a different normalizer for risk can be used too. Possibly a synthetic one, that just recieves a standard deviation and then does a random normal?
+```{r, include = FALSE}
+DEBUG <- TRUE
+```
+
+```{r, include = FALSE}
+#load libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+We want to calculate the carry of each currency. The Carry $C$, of currency $i$ against USD, at time $t$ and horizon $h\in (0,12)$ in months (the time span into the future for the forward) can be computed as follows: $C_{i_t}^h=Forward_{i_t}^h-Spot_{i_t}^h$
+
+I use monthly data for the following to reduce noise and speed up computation time. This methodology is further validated by application constraints, as daily reallocation positions results in high trading costs.
+```{r}
+#load fx spot amd forward rates
+load("./Data/fx_spots_and_6m_forwards.RData")
+```
+
+As forward rates are described at the spread to the current spot rate in my data set the forward variable turns out to be the carry already.
+```{r}
+colnames(fx_spots_and_6m_forwards)[4] <- "6m_carry"
+fx_spots_and_carry <- fx_spots_and_6m_forwards
+rm(fx_spots_and_6m_forwards)
+```
+
+#Backtesting
+We will now experiment with strategies by utilizing the data in various approaches.
+
+##Simple strategy
+The simple strategy can be imposed right away. It does not include any timing variants and will only use the currency with the highest and lowest carry signal as suggested by Brunnermeier, Nagel and Peterson (2008). Moreover, the small transaction volume at PMP makes it even less efficient to trade multiple currencies. This strategy will further be used as a benchmark the measure the impact of a timed alternative.
+
+We need to compare the values for each date to find the currency with the highest (lowest) carry. This will be the investment (funding) currency.
+```{r}
+max_min_carry_per_date <- fx_spots_and_carry %>%
+  group_by(date) %>%
+  summarize(
+    max_6m_carry = max(`6m_carry`, na.rm = TRUE),
+    min_6m_carry = min(`6m_carry`, na.rm = TRUE),
+    long_currency = currency[which.max(`6m_carry`)],
+    short_currency = currency[which.min(`6m_carry`)]
+  )
+```
+
+We are plotting the Long (Short) Currencies.
+```{r}
+# Convert long_currency and short_currency to factors
+max_min_carry_per_date$long_currency <- factor(max_min_carry_per_date$long_currency)
+max_min_carry_per_date$short_currency <- factor(max_min_carry_per_date$short_currency)
+
+# Plot the currencies with the maximum carry over time
+ggplot(max_min_carry_per_date) +
+  geom_point(aes(x = date, y = long_currency, color = "Long Currency"), size = 2) +
+  geom_point(aes(x = date, y = short_currency, color = "Short Currency"), size = 2) +
+  labs(title = "Currencies with Maximum and Minimum Carry Over Time",
+       x = "Date",
+       y = "Currency",
+       color = "Legend") +
+  scale_color_manual(values = c("Long Currency" = "red", "Short Currency" = "blue")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We can now use return data to compute returns of the simple strategy.
+```{r}
+#Load the data frame
+load("./Data/fx_log_returns.RData")
+
+#Take max_min_carry_per_date and merge with respective log returns.
+max_min_carry_per_date <- max_min_carry_per_date[c("date","long_currency","short_currency")]
+
+# Ensure the currency columns in fx_log_returns are factors to match max_min_carry_per_date
+fx_log_returns <- fx_log_returns %>%
+  mutate(currency = as.factor(currency))
+
+# Join the data frames
+simple_strategy_df <- max_min_carry_per_date %>%
+  left_join(fx_log_returns, by = c("date" = "date", "long_currency" = "currency")) %>%
+  rename(long_log_return = log_return) %>%
+  left_join(fx_log_returns, by = c("date" = "date", "short_currency" = "currency")) %>%
+  rename(short_log_return = log_return)
+
+# Display the structure of the joined data
+str(simple_strategy_df)
+
+if(DEBUG != TRUE){
+  rm(max_min_carry_per_date)
+}
+```
+Compute monthly strategy returns.
+```{r}
+#Properly account for short exposure
+simple_strategy_df$short_log_return <- simple_strategy_df$short_log_return*(-1)
+
+#Calculate monthly total returns and cumulative total returns. We deal with NAs by "not investing" resulting in 0 total returns in the given month.
+simple_strategy_df <- simple_strategy_df %>%
+  mutate(total_log_return = long_log_return + short_log_return) %>%
+  mutate(total_log_return = replace_na(total_log_return, 0)) %>%
+  mutate(cumulative_log_return = cumsum(total_log_return))
+```
+
+We plot the simple strategy, because... why not!
+```{r}
+ggplot(simple_strategy_df, aes(x = date, y = cumulative_log_return)) +
+  geom_line() +
+  labs(title = "Cumulative Log Returns Over Time",
+       x = "Date",
+       y = "Cumulative Log Return") +
+  theme_minimal()
+```
+
+```{r}
+
+```

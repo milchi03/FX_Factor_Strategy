@@ -1,0 +1,306 @@
+---
+title: "Carry_Strategy"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+Starting off by loading libraries and the data. Instead of the S&P500, a different normalizer for risk can be used too. Possibly a synthetic one, that just recieves a standard deviation and then does a random normal?
+```{r}
+DEBUG <- FALSE
+```
+
+```{r}
+#load libraries
+library(dplyr)
+library(ggplot2)
+
+#load FX return data
+#make sure the loaded dataframe has the name "return_data"!!
+load("./Data/return_data.RData")
+
+#load benchmark log returns and standard deviation data.
+#make sure the loaded dataframe has the name "benchmark" and is structured as: $Date, $Benchmark:num with Benchmark holding standard deviations!!
+load("./Data/vix.RData")
+```
+
+Calculate the exponential moving averge (i.e. EMA) to normalize the risk level. I used a mid-term and short-term volatility measure later on where each of them contributes 50% to the final moving average.
+```{r}
+##Exponential Moving Average, EMA
+
+#exponential moving average function
+exp_mov_avg <- function(x, window, half_life) {
+  # Calculate the decay factor lambda
+  lambda <- (1/2)^(1/half_life)
+  
+  # Initialize the result vector
+  ewma <- numeric(length(x))
+  
+  # Calculate the initial mean for the first window elements
+  ewma[1:window-1] <- NA
+  
+  ewma[window] <- mean(x[1:window], na.rm = TRUE)
+  
+  
+  # Calculate the EWMA for the rest of the elements
+  for (i in (window + 1):length(x)) {
+    #NA treatment
+    if(is.na(x[i])){
+      ewma[i] <- ewma[i-1]
+    }
+    else{
+      ewma[i] <- lambda * x[i] + (1 - lambda) * ewma[i - 1]
+    }
+  }
+  return(ewma)
+}
+
+#set parameters for EMA1
+window <- 510
+half_life <- 510
+
+#calculate EMA1
+currency_EMA1 <- return_data %>%
+  mutate(across(where(is.numeric), ~ {
+    # Find the index of the first non-NA value
+    first_non_na <- which(!is.na(.x))[1]
+    if (is.na(first_non_na)) {
+      # If the entire column is NA, return the column as is
+      return(.x)
+    } else {
+      # Apply the exp_mov_avg function only from the first non-NA value
+      ewma <- exp_mov_avg(.x[first_non_na:length(.x)], window = window, half_life = half_life)
+      # Pad the result with NAs to match the original length
+      c(rep(NA, first_non_na - 1), ewma)
+    }
+  }))
+
+#set parameters for EMA2
+window <- 15
+half_life <- 15
+
+#calculate EMA2
+currency_EMA2 <- return_data %>%
+  mutate(across(where(is.numeric), ~ {
+    # Find the index of the first non-NA value
+    first_non_na <- which(!is.na(.x))[1]
+    if (is.na(first_non_na)) {
+      # If the entire column is NA, return the column as is
+      return(.x)
+    } else {
+      # Apply the exp_mov_avg function only from the first non-NA value
+      ewma <- exp_mov_avg(.x[first_non_na:length(.x)], window = window, half_life = half_life)
+      # Pad the result with NAs to match the original length
+      c(rep(NA, first_non_na - 1), ewma)
+    }
+  }))
+
+# Combine the data frames by averaging corresponding cells
+currency_EMA <- currency_EMA1 %>%
+  mutate(across(where(is.numeric), ~ 0.5 * .x + 0.5 * currency_EMA2[[cur_column()]]))
+
+
+# Clean up
+if((!DEBUG)){
+  rm(return_data, currency_EMA1, currency_EMA2,
+   window, half_life,
+   exp_mov_avg)
+}
+```
+
+From the EMA I computed the standard deviation as a measure of risk.
+```{r}
+## Deriving the standard deviation of the exp mov average and the benchmark risk level
+# Define function
+calculate_rolling_sd <- function(log_returns, window){
+  rollapply(log_returns, width = window, FUN = var, fill = NA, align = "right")
+}
+# Define parameters
+window <- 63 # approximately number of trading days in 3 months
+
+#Apply the function
+currency_EMA <- currency_EMA %>%
+  mutate(across(where(is.numeric),
+                ~ calculate_rolling_sd(., window = window),
+                .names = "{.col}.sd"))
+
+
+# Clean up
+if((!DEBUG)){
+  rm(calculate_rolling_sd,
+     window)
+}
+```
+
+Organize a little...
+```{r}
+##Rename the currency EMA data frame to normalized currency df and drop redundant columns.
+
+# Find the index of the first row where first column is not NA
+first_non_na_index <- which(!is.na(currency_EMA[, 2]))[1]+60
+normalized_currency_exposure_df <- currency_EMA %>%
+  slice((first_non_na_index:n()))
+
+# Subset the columns as per the previous requirement
+normalized_currency_exposure_df <- normalized_currency_exposure_df %>%
+  select(1, ends_with("sd"))
+
+# Prepare for left join
+colnames(benchmark) <- c("Date", "Benchmark")
+
+# Merge the benchmark to the rest
+normalized_currency_exposure_df <- left_join(x = normalized_currency_exposure_df, y = benchmark, by = "Date")
+
+# Rearrange columns
+normalized_currency_exposure_df <- normalized_currency_exposure_df %>%
+  select(1, ncol(.), 2:(ncol(.) - 1))
+
+
+
+# Clean up
+if((!DEBUG)){
+  rm(currency_EMA,
+     first_non_na_index)
+}
+```
+
+Calculate the normalized exposure coefficient. It represents how much a currency forward needs to be scaled to normalize it to the risk of the benchmark. Recognize that these numbers are not relative to the investment sum yet. You receive how much you must invest in a currency by answering the question: How much money do we want to invest to the risk of the SP500 implied risk for the next year. Then devide by the normalized value.
+
+As an example: Let's say the carry signal suggest investing in AUD. You want to put down 100.000$ for the strategy
+```{r}
+# Normalize 
+normalized_currency_exposure_df <- normalized_currency_exposure_df %>%
+  mutate(across(-c(Date, Benchmark), ~ Benchmark / ., .names = "{col}.normalized"))
+
+```
+
+Organize a little more...
+```{r}
+# Drop unnecessary columns
+normalized_currency_exposure_df <- normalized_currency_exposure_df %>%
+  select(1,2,ends_with("normalized"))
+
+# Remove inf columns
+normalized_currency_exposure_df <- normalized_currency_exposure_df %>%
+  select(where(~ all(is.finite(.) | is.na(.))))
+
+# Check your results across currencies
+normalized_currency_exposure_df %>%
+  select(-c("Date","Benchmark")) %>%
+  unlist(use.names = FALSE) %>%
+  summary()
+```
+
+Now we want to calculate the carry of each currency. The Carry $C$, of currency $i$ against USD, at time $t$ and horizon $h\in (0,12)$ in months (the time span into the future for the forward) can be computed as follows: $C_{i_t}^h=Forward_{i_t}^h-Spot_{i_t}^h)$
+
+To do this we need a new data set that contains forward rates. For simplicity we switch to monthly data from now on.
+```{r}
+#load fx forward rates
+load("./Data/fx_forwards.RData")
+#load fx spot rates
+load("./Data/fx_spots.RData")
+```
+
+We need to merge the datasets properly to later calculate carry. 
+```{r}
+for(currency_index in 2:ncol(fx_forwards))
+forwards_spots_merged <- inner_join(x = fx_forwards, y = fx_spots, by = "Date")
+rm(currency_index)
+
+#Clean up
+if((!DEBUG)){
+  rm(fx_forwards, fx_spots)
+}
+```
+
+Now we can calculate the carry with the formula above.(maybe later with daily data and the average carry over 1month, might reduce noise)
+```{r}
+#preperations
+forward_currencies <- sub("\\.3m_forward$", "", colnames(forwards_spots_merged)[grep("\\.3m_forward$", colnames(forwards_spots_merged))])
+spot_currencies <- sub("\\.spot$", "", colnames(forwards_spots_merged)[grep("\\.spot$", colnames(forwards_spots_merged))])
+currency_list <- intersect(forward_currencies, spot_currencies)
+carry_df <- data.frame("Date" = forwards_spots_merged$Date)
+
+# Loop through the currency list and calculate the carry
+for (currency in currency_list) {
+  forward_col <- paste0(currency, ".3m_forward")
+  spot_col <- paste0(currency, ".spot")
+  carry_col <- paste0(currency, "_carry")
+  
+  # Calculate the carry and add it to carry_df
+carry_df <- carry_df %>%
+  mutate(!!carry_col := forwards_spots_merged[[forward_col]] - forwards_spots_merged[[spot_col]])
+}
+rm(currency, forward_col, spot_col, carry_col)
+
+
+# Clean up
+if((!DEBUG)){
+  rm(forwards_spots_merged,
+     currency_list, forward_currencies, spot_currencies)
+}
+```
+
+No we can use this data frame for some back testing. First we will not use a timed strategy but start off with just the basic carry trade. Every 6 months we will go long the currency with the highest carry and short the one with the lowest.
+```{r}
+# Calculate min_carry and max_carry
+backtest <- carry_df %>%
+  rowwise() %>%
+  mutate(
+    min_carry = min(0,min(c_across(-Date), na.rm = TRUE)),
+    max_carry = max(0,max(c_across(-Date), na.rm = TRUE))) %>%
+  ungroup()
+
+# Remove rows with -Inf results
+backtest <- backtest %>%
+  filter(is.finite(min_carry) & is.finite(max_carry))
+
+# Name short and long currencies
+backtest <- backtest %>%
+  mutate(
+    min_carry_currency = apply(.[-1], 1, function(x) names(.)[-1][which.min(x)]),
+    max_carry_currency = apply(.[-1], 1, function(x) names(.)[-1][which.max(x)])
+  )
+backtest$min_carry_currency <- sub("_carry", "", backtest$min_carry_currency)
+backtest$max_carry_currency <- sub("_carry", "", backtest$max_carry_currency)
+
+#Temporarily!!!
+backtest$min_carry_currency <- gsub("min","USD", backtest$min_carry_currency)
+backtest$max_carry_currency <- gsub("max","USD", backtest$max_carry_currency)
+
+#We do not need carry data in the backtest data frame anymore
+backtest <- backtest %>%
+  select(Date, min_carry_currency, max_carry_currency)
+```
+
+Load log return data to evaulate the performance
+```{r}
+#Load log returns (CURRENTLY USING DAILY RETURNS BUT MONTHLY EVALUATION. I NEED BETTER DATA)
+load("./Data/return_data.RData")
+
+#merge data frames
+backtest <- inner_join(x = backtest, y = return_data, by = "Date")
+
+#evaluate funding and investment currencies
+backtest <- backtest %>%
+  rowwise() %>%
+  min_carry_currency_index <- colnames(backtest)[[min_carry_currency]] %>%
+  mutate(short_log_return = backtest[[min_carry_currency_index]])
+
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```

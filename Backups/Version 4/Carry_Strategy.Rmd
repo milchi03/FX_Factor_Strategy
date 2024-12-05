@@ -1,0 +1,211 @@
+---
+title: "Carry_Strategy"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "r Sys.Date()"
+output: html_document
+---
+
+To Do's:
+Set up proper data loading
+Inlcude 3 factors that Simion sent (in icloud -> Studium -> Simion, Giorgia "Questions")
+Statistical interactions
+
+
+Starting off by loading libraries and the data.
+```{r, include = FALSE}
+#load libraries
+library(dplyr) #general use
+library(forecast) #for autoregression models
+library(ggplot2) #plots
+
+#Debug T = on/ F = off
+DEBUG <- FALSE
+```
+
+We want to calculate the carry of each currency. The Carry $C$, of currency $i$ against USD, at time $t$ and horizon $h\in (0,12)$ in months (the time span into the future for the forward) can be computed as follows: $C_{i_t}^h=Forward_{i_t}^h-Spot_{i_t}^h$
+
+Luckily this is the same as forward spreads which is the standard way of downloading forward data via Bloomberg. Therefore, no further calculations are necessary to find carry.
+
+I use monthly data for the following to reduce noise and speed up computation time. This methodology is further validated by application constraints, as reallocating more often results in extremly high trading costs.
+
+Other factors we load are:
+liquidity = (bid-ask) / ((bid+ask)/2), capturing relative spread relative to price.
+VIX, which is the implied volatility of the S&P500 for one year, basically markets anticipation of risk for the next year.
+```{r}
+#load data sets.
+load("./Data/fx_log_returns.RData")
+load("./Data/fx_carry.RData")
+load("./Data/fx_liquidity.RData")
+
+#Merge Datasets
+fx_factors <- left_join(x = fx_log_returns, y = fx_carry, by = join_by(currency, date))
+fx_factors <- left_join(x = fx_factors, y = fx_liquidity, by = join_by(currency, date))
+
+#Data Cleaning
+fx_factors <- fx_factors %>% ungroup()
+fx_factors$currency <- as.factor(fx_factors$currency)
+fx_factors$date <- as.Date(fx_factors$date)
+str(fx_factors)
+
+#display df
+head(fx_factors, 20) %>% 
+  knitr::kable()
+
+# Clean up!
+if (DEBUG != TRUE) {
+  rm(fx_carry, fx_liquidity, fx_log_returns)
+}
+```
+
+#Building models
+##Factor Portfolio Construction
+We build factor portfolios for all factors by defining a function that takes a factor and puts together the n best and worst performing positions under the given factor. The weighting scheme will be either 1/n or signal weighted.
+
+I also want to adjust the weighting to the risk contribution of each currency. https://books.google.at/books?hl=de&lr=&id=3_tZCgAAQBAJ&oi=fnd&pg=PP1&dq=weighting+investments+based+on+risk+in+a+factor+strategy&ots=F6YX8n9y4-&sig=CVb0Q8hxCU7haLavyFrsi-Admfw#v=onepage&q=weighting%20investments%20based%20on%20risk%20in%20a%20factor%20strategy&f=false P.18. maybe? We also aim to use Markowitz for the final portfolio composition because every factor portfolio should have some expected return and some variance. This can be used for the optimization.
+
+Signal weighting takes sum of the factor levels for each currency for the n best or worst currencies and then takes their individual factor level relative to the overall factor level.
+
+```{r}
+#Define the within-portfolio weighting schemes via their own function.
+weighting_one_over_n <- function(data.timestamp = data.frame(currency = NA,
+                                         date = NA,
+                                         log_return = NA,
+                                         fx_factor = NA),
+                                 n = 1,
+                                 mode = "1/n"){
+  
+  colnames(data.timestamp)[4] <- "fx_factor"
+  
+  if(mode == "1/n"){
+    long_leg <- data.timestamp %>%
+    arrange(desc(fx_factor)) %>%
+    head(n) %>%
+    summarize(
+    mean_log_return = mean(log_return),
+    currency_list = paste0(currency, collapse = ", "),
+    weights = paste0(rep(1 / n, n), collapse = ", ")) %>%
+      {list(mean_log_return = .$mean_log_return, currency_list = .$currency_list, weights = .$weights)}
+
+  
+    short_leg <- data.timestamp %>%
+    arrange(fx_factor) %>%
+    head(n) %>%
+    summarize(
+    mean_log_return = mean(log_return),
+    currency_list = paste0(currency, collapse = ", "),
+    weights = paste0(rep(1 / n, n), collapse = ", ")) %>%
+      {list(mean_log_return = .$mean_log_return, currency_list = .$currency_list, weights = .$weights)}
+  }else if(mode == "relative_signal"){
+    long_leg <- data.timestamp %>%
+    arrange(desc(fx_factor)) %>%
+    head(n) %>%
+    mutate(weight = fx_factor / sum(fx_factor)) %>%
+    summarize(
+    mean_log_return = sum(log_return * weight),  # Weighted mean of log_return
+    currency_list = paste0(currency, collapse = ", "),
+    weights = paste0(weight, collapse = ", ")) %>%  # Add weights as a concatenated string
+      {list(mean_log_return = .$mean_log_return, currency_list = .$currency_list, weights = .$weights)}
+    
+    short_leg <- data.timestamp %>%
+    arrange(fx_factor) %>%
+    head(n) %>%
+    mutate(weight = fx_factor / sum(fx_factor)) %>%
+    summarize(
+    mean_log_return = sum(log_return * weight),  # Weighted mean of log_return
+    currency_list = paste0(currency, collapse = ", "),
+    weights = paste0(weight, collapse = ", ")  # Add weights as a concatenated string
+  ) %>%
+      {list(mean_log_return = .$mean_log_return, currency_list = .$currency_list, weights = .$weights)}
+  }
+  
+  return(list(log_return = long_leg[["mean_log_return"]] - short_leg[["mean_log_return"]],
+              long_currencies = long_leg[["currency_list"]],
+              short_currencies = short_leg[["currency_list"]],
+              long_weights = long_leg[["weights"]],
+              short_weights = short_leg[["weights"]]))
+  
+}
+
+portfolio_construction <- function(data = data.frame(currency = NA,
+                                                     date = NA,
+                                                     log_return = NA,
+                                                     fx_factor = NA),
+                                   n = 1,
+                                   mode = "1/n"){
+
+  factor_portfolio <- data.frame(date = unique(data$date),
+                                 log_return = NA,
+                                 long_currencies = NA,
+                                 short_currencies = NA,
+                                 long_weights = NA,
+                                 short_weights = NA)
+  for(i in 1:nrow(factor_portfolio)){
+    factor_portfolio[i,2:6]  <- weighting_one_over_n(data.timestamp = data %>% filter(date == factor_portfolio[i,1]),
+                                                     n = n,
+                                                     mode = mode)
+  }
+'factor_portfolio <- data %>%
+  group_by(date) %>%
+  summarise(
+    log_return = weighting_one_over_n(n = n)[["log_return"]],
+    long_currencies = weighting_one_over_n(n = n)[["long_currencies"]],
+    short_currencies = weighting_one_over_n(n = n)[["short_currencies"]]
+  ) %>%
+  ungroup()
+'  
+  return(factor_portfolio) 
+}
+```
+
+With this loop we can now construct each factor portfolio at once. There is a bug that the last factor is generated twice and saved as `factor_portfolio`. I will take care of that at some other time.
+```{r}
+mode_list = c("1/n", "relative_signal")
+factor_list = c(colnames(fx_factors[-c(1:3)]))
+
+for(i in 4:ncol(fx_factors) ){
+  
+  factor_portfolio <- portfolio_construction(fx_factors[c(1:3,i)],
+                                             n = 2,
+                                             mode = "relative_signal")
+  
+  #add a cumulative sum column
+  factor_portfolio <- factor_portfolio %>%
+    mutate(cum_log_return = cumsum(log_return))
+  
+  # Assign the factor portfolio to a dynamically named variable
+  assign(paste0("factor_portfolio.", fx_factor <- colnames(fx_factors)[i]), factor_portfolio)
+}
+
+# Clean up!
+if (DEBUG != TRUE) {
+  rm(i, fx_factor)
+}
+```
+
+Plot individual factors.
+```{r}
+plot_factor_portfolio <- function(factor_portfolio, factor_name, line_color = "blue") {
+  ggplot(factor_portfolio, aes(x = date, y = cum_log_return)) +
+    geom_line(color = line_color, size = 1) +
+    labs(
+      title = paste("Cumulative Log Returns for", factor_name, "Over Time"),
+      x = "Date",
+      y = "Cumulative Log Return"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    )
+}
+
+plot_factor_portfolio(factor_portfolio = factor_portfolio.carry, factor_name = "carry")
+
+```
+
+```{r}
+
+```
