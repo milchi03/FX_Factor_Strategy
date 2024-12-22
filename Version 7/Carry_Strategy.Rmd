@@ -1,0 +1,604 @@
+---
+title: "Carry_Strategy"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "r Sys.Date()"
+output: html_document
+---
+
+Starting off by loading libraries and the data.
+```{r, include = FALSE}
+#load libraries
+library(dplyr) #general use
+library(ggplot2) #plots
+
+#Debug T = on/ F = off
+DEBUG <- FALSE
+```
+
+We want to calculate the carry of each currency. The Carry $C$, of currency $i$ against USD, at time $t$ and horizon $h\in (0,12)$ in months (the time span into the future for the forward) can be computed as follows: $C_{i_t}^h=Forward_{i_t}^h-Spot_{i_t}^h$
+
+Luckily this is the same as forward spreads which is the standard way of downloading forward data via Bloomberg. Therefore, no further calculations are necessary to find carry.
+
+I use monthly data for the following to reduce noise and speed up computation time. This methodology is further validated by application constraints, as reallocating more often results in extremly high trading costs.
+
+Other factors we load are:
+liquidity = (bid-ask) / ((bid+ask)/2), capturing relative spread relative to price.
+VIX, which is the implied volatility of the S&P500 for one year, basically markets anticipation of risk for the next year.
+```{r}
+#load data sets.
+fx_factors <- get(load("Data/fx_factors.RData"))
+risk_free_rate <- get(load("Data/RF_EUR.RData"))
+
+#tmp fixes
+rm(RF_USD)
+
+#display df
+head(fx_factors %>% arrange(sample(n())), 20)
+```
+# Preprocessing
+
+We want to detect outliers systematically so we use the IQR method.
+```{r}
+detect_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower_bound <- q1 - 1.5 * iqr
+  upper_bound <- q3 + 1.5 * iqr
+  x < lower_bound | x > upper_bound
+}
+
+fx_factors %>%
+  select_if(is.numeric) %>%
+  summarise(across(everything(), ~ sum(detect_outliers(.))))
+```
+# Building models
+## Factor Portfolio Construction
+We build synthetic factor portfolios by having exposure to all currencies with the exact exposure being a function of the factor sizes.
+
+We need a weighting function that assigns the exposure in each synthetic factor.
+```{r}
+weighting <- function(data.timestamp, weighting_function){
+  colnames(data.timestamp)[4] <- "characteristic"
+  
+  if(weighting_function == "demeaned_relative_signal"){
+    mean = mean(data.timestamp$characteristic)
+  
+    data.timestamp$demeaned_characteristic <- data.timestamp$characteristic - mean
+    
+    # Assign weights proportionally to the absolute values within each group
+    positive_values <- data.timestamp$demeaned_characteristic[data.timestamp$demeaned_characteristic > 0]
+    negative_values <- data.timestamp$demeaned_characteristic[data.timestamp$demeaned_characteristic < 0]
+    
+    data.timestamp$weight <- ifelse(
+      data.timestamp$demeaned_characteristic > 0,
+      data.timestamp$demeaned_characteristic / sum(positive_values, na.rm = TRUE),
+      ifelse(
+        data.timestamp$demeaned_characteristic < 0,
+        data.timestamp$demeaned_characteristic / abs(sum(negative_values, na.rm = TRUE)),
+        0
+      )
+    )
+  
+    data.timestamp$demeaned_characteristic <- NULL
+  }
+  
+  if(weighting_function == "demeaned_relative_rank"){
+    
+    data.timestamp$rank <- rank(data.timestamp$characteristic, ties.method = "average")
+    n <- nrow(data.timestamp)
+    
+    #linear function to produce relative ranks (similar to other methods but relative ranks not signal)
+    data.timestamp$weight <- 8/n^2 * data.timestamp$rank - 4*(n+1)/n^2 
+    
+    data.timestamp$rank <- NULL
+    
+  }
+  
+  return(data.timestamp)
+}
+```
+
+We put together the synthetic single factor portfolios.
+```{r}
+#wtf, for carry i = 144, i = 60 return crazy results
+# and for Mom_3m i = 177
+
+single_factor <- function(fx_factor){
+  
+  #inititalize
+  weighted_returns <- data.frame(date = unique(fx_factor$date),
+                                 log_return = NA)
+  #loop through dates
+  for(i in 1:length(weighted_returns$date)){
+    
+    weighted_subset <- weighting(
+      fx_factor %>% filter(date == weighted_returns$date[i]),
+      weighting_function = "demeaned_relative_rank" 
+      ) #choose from demeaned_relative_signal and demeaned_relative_rank
+    
+    log_return = sum(weighted_subset$log_return * weighted_subset$weight)
+    
+    weighted_returns$log_return[i] <- log_return
+  }
+  
+  weighted_returns$cum_log_return <- cumsum(weighted_returns$log_return)
+    
+  return(weighted_returns)
+}
+```
+
+Now we loop through the different characteristics.
+```{r}
+factor_portfolios <- data.frame(date = unique(fx_factors$date))
+
+for(i in 4:ncol(fx_factors)){
+  
+  factor_portfolio <- single_factor(fx_factor = fx_factors[,c(1:3,i)])
+  
+  colnames(factor_portfolio)[2] <- colnames(fx_factors)[i]
+  colnames(factor_portfolio)[3] <- paste0(colnames(fx_factors)[i],".cum")
+  
+  factor_portfolios <- left_join(x = factor_portfolios,
+                                 y = factor_portfolio,
+                                 by = "date")
+}
+rm(factor_portfolio, i)
+
+#we use these for convenience
+fac_port_single <- factor_portfolios %>%
+  select(date, everything(), -matches("\\.cum$")) %>%
+  pivot_longer(cols = -date, names_to = "Factor", values_to = "LogReturn")
+
+fac_port_cum <- factor_portfolios %>%
+  select(date, matches("\\.cum$")) %>%
+  pivot_longer(cols = -date, names_to = "Factor", values_to = "CumLogReturn")
+```
+
+
+```{r}
+ggplot(fac_port_cum %>% filter(Factor != "REER_minus_100.cum"), aes(x = date, y = CumLogReturn, color = Factor)) +
+  geom_line() +
+  labs(
+    title = "Cumulative Log Returns",
+    x = "Date",
+    y = "Cumulative Log Return",
+    color = "Factor"
+  ) +
+  theme_minimal()
+
+```
+Classic ML style, I want to save some testing data for later.
+```{r}
+training_data <- factor_portfolios %>%
+  filter(date <= as.Date("2018-06-29")) %>%
+  select(date, everything(), -matches("\\.cum$"))
+
+testing_data <- factor_portfolios %>% filter(date > as.Date("2018-06-29"))
+
+TRY_data <- fx_factors %>%
+  filter(Currency == "TRY") %>%
+  filter(date <= as.Date("2018-06-29")) %>%
+  select("date", "log_return")
+
+lmTRY <- lm(
+  TRY_data$log_return ~ training_data$Carry + training_data$REER_historic_mean_ratio
+  )
+```
+
+```{r}
+# Prepare training data
+training_data <- factor_portfolios %>%
+  filter(date <= as.Date("2018-06-29")) %>%
+  select(date, everything(), -matches("\\.cum$"))
+
+# Filter TRY-specific data
+TRY_data <- fx_factors %>%
+  filter(Currency == "JPY") %>%
+  filter(date <= as.Date("2018-06-29")) %>%
+  select(date, log_return)
+
+# Merge training_data with TRY_data
+merged_data <- TRY_data %>%
+  left_join(training_data, by = "date")
+
+# Run regression for TRY
+lmTRY <- lm(log_return ~ ., data = merged_data %>% select(log_return, 2:11))
+
+# Print summary of the model
+summary(lmTRY)
+anova(lmTRY)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+
+```{r}
+# Define the within-portfolio weighting schemes via their own function.
+weighting <- function(data.timestamp, n = 1, mode = "1/n", strategy = "long_short", liquidity_threshold = NULL) {
+  colnames(data.timestamp)[5] <- "fx_factor"
+  
+  # Filter out illiquid currencies if threshold is specified
+  if (!is.null(liquidity_threshold)) {
+    data.timestamp <- data.timestamp %>%
+      filter(Liquidity <= liquidity_threshold)
+  }
+  
+  # Generate long leg
+  long_leg <- data.timestamp %>%
+    arrange(desc(fx_factor)) %>%
+    head(n) %>%
+    mutate(
+      weight = if (mode == "1/n") 1 / n else fx_factor / sum(fx_factor),
+      scaled_log_return = log_return * weight,  # Scale log returns by weights
+      leg = "long"
+    )
+  
+  # Generate short leg
+  short_leg <- data.timestamp %>%
+    arrange(fx_factor) %>%
+    head(n) %>%
+    mutate(
+      weight = if (mode == "1/n") -1 / n else fx_factor / sum(fx_factor),
+      scaled_log_return = log_return * weight,  # Scale log returns by weights
+      leg = "short"
+    )
+  
+  # Adjust based on strategy
+  if (strategy == "long_only") {
+    short_leg <- data.frame()
+  } else if (strategy == "short_only") {
+    long_leg <- data.frame()
+  }
+  
+  # Combine legs into one data frame
+  combined_legs <- bind_rows(long_leg, short_leg) %>%
+    select(Currency, date, scaled_log_return, weight, leg)
+  
+  colnames(combined_legs)[3] <- "log_return"
+  
+  return(combined_legs)
+}
+
+# Function to construct portfolio
+portfolio_construction <- function(data, n = 1, mode = "1/n", strategy = "long_short", liquidity_threshold = NULL, factor_name = "") {
+  # Initialize portfolio data frame
+  factor_portfolio <- data.frame(
+    Currency = character(),
+    date = as.Date(character()),
+    log_return = numeric(),
+    weight = numeric(),
+    leg = character(),
+    factor_name = character()
+  )
+  
+  # Loop through unique dates and construct portfolios
+  for (current_date in unique(data$date)) {
+    weighted_data <- weighting(
+      data.timestamp = data %>% filter(date == current_date),
+      n = n,
+      mode = mode,
+      strategy = strategy,
+      liquidity_threshold = liquidity_threshold
+    )
+    if (nrow(weighted_data) > 0) {
+      weighted_data <- weighted_data %>%
+        mutate(factor_name = factor_name)
+      factor_portfolio <- bind_rows(factor_portfolio, weighted_data)
+    }
+  }
+  
+  return(factor_portfolio)
+}
+```
+
+We need a few helper functions.
+```{r}
+# Helper functions for factor log returns of a portfolio
+compute_factor_log_return <- function(factor_portfolio, start_date = NULL, end_date = NULL) {
+  factor_log_return <- factor_portfolio
+
+# Filter by start_date if provided
+if (!is.null(start_date)) {
+  factor_log_return <- factor_log_return %>%
+    filter(date >= as.Date(start_date))
+}
+
+# Filter by end_date if provided
+if (!is.null(end_date)) {
+  factor_log_return <- factor_log_return %>%
+    filter(date <= as.Date(end_date))
+}
+
+# Group and summarize
+factor_log_return <- factor_log_return %>%
+  group_by(date) %>%
+  summarise(dates_log_return = sum(log_return, na.rm = TRUE)) %>%
+  ungroup()
+  
+  return(factor_log_return)
+}
+
+compute_cumulative_log_return <- function(factor_portfolio, start_date = NULL, end_date = NULL) {
+  filtered_log_return <- compute_factor_log_return(factor_portfolio)
+  
+  # Filter by start_date if provided
+  if (!is.null(start_date)) {
+    filtered_log_return <- filtered_log_return %>%
+      filter(date >= as.Date(start_date))
+  }
+  
+  # Filter by end_date if provided
+  if (!is.null(end_date)) {
+    filtered_log_return <- filtered_log_return %>%
+      filter(date <= as.Date(end_date))
+  }
+  
+  # Compute cumulative log return
+  cum_log_return <- filtered_log_return %>%
+    mutate(cum_log_return = cumsum(dates_log_return)) %>%
+    select(-dates_log_return) # Optionally remove dates_log_return
+  
+  return(cum_log_return)
+}
+
+# Helper function for plotting cumulative log returns
+plot_factor_portfolio <- function(factor_portfolio, factor_name, line_color = "blue", y_min = NULL, y_max = NULL) {
+  cum_log_return <- compute_cumulative_log_return(factor_portfolio)
+  
+  # Create the base plot
+  plot <- ggplot(cum_log_return, aes(x = date, y = cum_log_return)) +
+    geom_line(color = line_color, size = 1) +
+    labs(
+      title = paste("Cumulative Log Returns for", factor_name, "Over Time"),
+      x = "Date",
+      y = "Cumulative Log Return"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    )
+  
+  # Add y-axis limits if specified
+  if (!is.null(y_min) & !is.null(y_max)) {
+    plot <- plot + ylim(y_min, y_max)
+  }
+  
+  return(plot)
+}
+
+# Helper function for portfolio risk measures
+risk_measure_summary <- function(
+    factor_portfolio,
+    risk_free_rate,
+    start_date = NULL,
+    end_date = NULL){
+  #pull underlying data
+  simple_log_return <- compute_factor_log_return(factor_portfolio, start_date, end_date)
+  cum_log_return <- compute_cumulative_log_return(factor_portfolio, start_date, end_date)
+  num_periods <- nrow(simple_log_return)
+  risk_free_rate <- (1 + mean(risk_free_rate$Level, na.rm = TRUE))^(1 / 12) - 1
+  
+  
+  #return measures
+  arithmetic_mean_return <- sum(simple_log_return$dates_log_return, na.rm = TRUE) / num_periods
+  geom_mean_return <- exp(arithmetic_mean_return) - 1
+  
+  #vola measures
+  volatility <- sd(simple_log_return$dates_log_return, na.rm = TRUE)
+  
+  #SR measure
+  sharpe_ratio <- (arithmetic_mean_return - risk_free_rate)/volatility
+  
+  return(data.frame(
+    arithmetic_mean_return = arithmetic_mean_return,
+    geom_mean_return = geom_mean_return,
+    volatility = volatility,
+    sharpe_ratio = sharpe_ratio
+  ))
+}
+
+#generate multi factor combinations
+generate_combinations <- function(factor_list, min_constituents = 1, max_constituents = NULL) {
+  # Set max_constituents to the length of the factor list if not provided
+  if (is.null(max_constituents)) {
+    max_constituents <- length(factor_list)
+  }
+  
+  # Validate input
+  if (min_constituents > max_constituents) {
+    stop("min_constituents cannot be greater than max_constituents")
+  }
+  
+  # Generate combinations for the specified range
+  combinations_list <- unlist(
+    lapply(min_constituents:max_constituents, function(k) combn(factor_list, k, simplify = FALSE)),
+    recursive = FALSE
+  )
+  
+  return(combinations_list)
+}
+```
+
+With this loop we can now construct each factor portfolio at once. There is a bug that the last factor is generated twice and saved as `factor_portfolio`. I will take care of that at some other time.
+```{r}
+# Define parameters
+mode_list <- c("1/n", "relative_signal")
+factor_list <- colnames(fx_factors)[-c(1:4)]  # Extract factor names excluding the first four columns
+strategy <- "long_only"  # Options: "long_only", "short_only", "long_short"
+liquidity_threshold <- 0  # Threshold for relative bid-ask spread
+
+# Loop through factor columns
+for (i in seq_along(factor_list)) {
+  factor_name <- factor_list[i]  # Current factor name
+  
+  # Construct the factor portfolio
+  factor_portfolio <- portfolio_construction(
+    data = fx_factors %>%
+      select(Currency, date, log_return, Liquidity, all_of(factor_name)),  # Select relevant columns
+    n = 10,
+    mode = "1/n",
+    strategy = strategy,
+    liquidity_threshold = liquidity_threshold,
+    factor_name = factor_name
+  )
+  
+  
+  
+  # Dynamically assign the factor portfolio to a variable
+  assign(paste0("factor_portfolio.", factor_name), factor_portfolio)
+}
+
+# Clean up temporary variables
+if (!exists("DEBUG") || !DEBUG) {
+  rm(i, factor_name, factor_portfolio)
+}
+
+```
+
+Plot individual factors.
+```{r}
+# Iterate through each factor in factor_list and plot its cumulative log return
+for (factor in factor_list) {
+  factor_portfolio <- get(paste0("factor_portfolio.", factor))
+  plot <- plot_factor_portfolio(factor_portfolio, factor_name = factor)
+  print(plot)
+}
+rm(factor, factor_portfolio, plot)
+```
+
+Gives a view over liquditiy.
+```{r}
+library(ggplot2)
+
+ggplot(fx_factors, aes(x = Currency, y = Liquidity)) +
+  geom_boxplot() +
+  labs(title = "Box Plots of Liquidity Grouped by Currency",
+       x = "Currency",
+       y = "Liquidity") +
+  theme_minimal(base_size = 10) +  # Increase base font size for the entire plot
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis labels
+    plot.title = element_text(size = rel(2)),           # Scale title size
+    axis.title = element_text(size = rel(1.5)),         # Scale axis title size
+    axis.text = element_text(size = rel(1.2))           # Scale axis text size
+  )
+```
+
+Now that we have the individual factor portfolios, we can move on to computing the multi factor ones. We need weighting schemes for that.
+```{r}
+factor_weighting <- function(data.timestamp, method = "1/n") {
+  if(method == "1/n"){
+    weights <- 1/length(unique(data.timestamp$factor_name))
+  }
+  return(weights)
+}
+
+portfolio_merging <- function(factor_combination = c(), method = "1/n") {
+  # Initialize multi-factor portfolio with the first factor portfolio
+  merged_factor_portfolio <- get(paste0("factor_portfolio.", factor_combination[1]))
+  
+  # Combine the factor portfolios dynamically
+  for (i in 2:length(factor_combination)) {
+    # Merge additional factor portfolios
+    merged_factor_portfolio <- rbind(merged_factor_portfolio, 
+                                     get(paste0("factor_portfolio.", factor_combination[i])))
+  }
+  
+  # Dynamically assign factor weights based on factor_combination
+  factor_weighting_storage <- merged_factor_portfolio %>%
+    group_by(date) %>%
+    reframe(
+      # Dynamically match factor_name with factor_combination for weights
+      factor_name = factor_combination,
+      factor_weight = factor_weighting(data.timestamp = cur_data())
+    )
+  
+  # Replace columns with adjusted values
+  merged_factor_portfolio <- merged_factor_portfolio %>%
+    left_join(factor_weighting_storage, by = c("date", "factor_name")) %>%
+    mutate(
+      log_return = log_return * factor_weight,
+      weight = weight * factor_weight
+    ) %>%
+    select(-c(factor_weight))
+  
+  
+  return(merged_factor_portfolio)
+}
+
+```
+
+We can now try it out.
+```{r}
+# Generate factor combinations
+factor_combinations_list <- generate_combinations(factor_list, min_constituents = 2, max_constituents = 2)
+
+# Initialize lists to store portfolios and results
+portfolios_list <- list()
+plots_list <- list()
+results_list <- list()
+
+# Loop through each factor combination
+for (i in 1:length(factor_combinations_list)) {
+  factor_combination <- factor_combinations_list[[i]]
+  
+  # Construct portfolio and store it in the portfolios list
+  portfolios_list[[i]] <- portfolio_merging(factor_combination = factor_combination)
+  portfolio_name <- paste(factor_combination, collapse = "_")
+  
+  # Plot cumulative log return and store the plot
+  plots_list[[i]] <- plot_factor_portfolio(
+    factor_portfolio = portfolios_list[[i]],
+    factor_name = portfolio_name,
+    y_min = -0.5,
+    y_max = 2.5
+  )
+  
+  # Compute risk metrics and store the result
+  risk_metrics <- risk_measure_summary(
+    factor_portfolio = portfolios_list[[i]],
+    risk_free_rate = risk_free_rate,
+    end_date = "2019-12-31"
+  )
+  
+  # Add the factor name to the result
+  risk_metrics$factor_name <- portfolio_name
+  results_list[[i]] <- risk_metrics
+}
+
+# Combine all results into a single data frame
+results_df <- do.call(rbind, results_list)
+
+# Print results
+print(results_df)
+
+# Optionally print plots
+for (plot in plots_list) {
+  print(plot)
+}
+
+save(portfolios_list, file = "portfolios_list.RData")
+save(results_df, file = "results_df.RData")
+
+# Clean up temporary variables
+if (!exists("DEBUG") || !DEBUG) {
+  rm(plot, factor_combinations_list, results_list, risk_metrics,
+     factor_combination, factor_list, i, portfolio_name)
+}
+```
