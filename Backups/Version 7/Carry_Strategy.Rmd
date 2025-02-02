@@ -1,0 +1,308 @@
+---
+title: "Carry_Strategy"
+author: "Maximilian Michlits"
+header-includes:
+   - \usepackage{bbm}
+date: "r Sys.Date()"
+output: html_document
+---
+
+Starting off by loading libraries and the data.
+```{r, include = FALSE}
+#load libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+We want to calculate the carry of each currency. The Carry $C$, of currency $i$ against USD, at time $t$ and horizon $h\in (0,12)$ in months (the time span into the future for the forward) can be computed as follows: $C_{i_t}^h=Forward_{i_t}^h-Spot_{i_t}^h$
+
+Luckily this is the same as forward spreads which is the standard way of downloading forward data via Bloomberg. Therefore, no further calculations are necessary to find carry.
+
+I use monthly data for the following to reduce noise and speed up computation time. This methodology is further validated by application constraints, as reallocating more often results in extremly high trading costs.
+
+Other factors we load are:
+liquidity = (bid-ask) / ((bid+ask)/2), capturing relative spread relative to price.
+VIX, which is the implied volatility of the S&P500 for one year, basically markets anticipation of risk for the next year.
+```{r}
+#load data sets.
+fx_factors <- get(load("Data/fx_factors.RData"))
+#risk_free_rate <- get(load("Data/RF_EUR.RData")) not needed for now
+
+#set global parameters
+date_end_of_training <- as.Date("2018-12-31") #until which point in time should the traiing data go?
+number_of_currencies <- 2 #how many currencies do you want to buy in every batch
+
+#tmp fixes
+#rm(RF_USD)
+fx_factors$REER_minus_100 <- NULL
+
+#display df
+head(fx_factors %>% arrange(sample(n())), 20)
+```
+# Preprocessing
+
+We want to detect outliers systematically so we use the IQR method.
+```{r}
+detect_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower_bound <- q1 - 1.5 * iqr
+  upper_bound <- q3 + 1.5 * iqr
+  x < lower_bound | x > upper_bound
+}
+
+fx_factors %>%
+  select_if(is.numeric) %>%
+  summarise(across(everything(), ~ sum(detect_outliers(.))))
+```
+# Building models
+## Factor Portfolio Construction
+We build synthetic factor portfolios by having exposure to all currencies with the exact exposure being a function of the factor sizes.
+
+We need a weighting function that assigns the exposure in each synthetic factor.
+```{r}
+weighting <- function(data.timestamp, weighting_function){
+  colnames(data.timestamp)[4] <- "characteristic"
+  
+  if(weighting_function == "demeaned_relative_signal"){
+    mean = mean(data.timestamp$characteristic)
+  
+    data.timestamp$demeaned_characteristic <- data.timestamp$characteristic - mean
+    
+    # Assign weights proportionally to the absolute values within each group
+    positive_values <- data.timestamp$demeaned_characteristic[data.timestamp$demeaned_characteristic > 0]
+    negative_values <- data.timestamp$demeaned_characteristic[data.timestamp$demeaned_characteristic < 0]
+    
+    data.timestamp$weight <- ifelse(
+      data.timestamp$demeaned_characteristic > 0,
+      data.timestamp$demeaned_characteristic / sum(positive_values, na.rm = TRUE),
+      ifelse(
+        data.timestamp$demeaned_characteristic < 0,
+        data.timestamp$demeaned_characteristic / abs(sum(negative_values, na.rm = TRUE)),
+        0
+      )
+    )
+  
+    data.timestamp$demeaned_characteristic <- NULL
+  }
+  
+  if(weighting_function == "demeaned_relative_rank"){
+    
+    data.timestamp$rank <- rank(data.timestamp$characteristic, ties.method = "average")
+    n <- nrow(data.timestamp)
+    
+    #linear function to produce relative ranks (similar to other methods but relative ranks not signal)
+    data.timestamp$weight <- 8/n^2 * data.timestamp$rank - 4*(n+1)/n^2 
+    
+    data.timestamp$rank <- NULL
+    
+  }
+  
+   if (weighting_function == "top_bottom_1_over_num") {
+     if (is.null(num)) stop("Specify 'num' parameter!")
+      
+      #sort
+     data.timestamp <- data.timestamp %>%
+      arrange(desc(characteristic))
+  
+    #initialize weights
+    data.timestamp$weight <- 0
+    
+    # Assign weights to the top and bottom 'num' rows
+    data.timestamp$weight[1:num] <- 1 / num
+    data.timestamp$weight[(nrow(data.timestamp) - num + 1):nrow(data.timestamp)] <- -1 / num
+  }
+  
+  return(data.timestamp)
+}
+```
+
+We put together the synthetic single factor portfolios.
+```{r}
+#wtf, for carry i = 144, i = 60 return crazy results
+# and for Mom_3m i = 177
+
+single_factor <- function(fx_factor){
+  
+  #inititalize
+  weighted_characteristic <- data.frame(date = unique(fx_factor$date),
+                                characteristic = NA)
+  #loop through dates
+  for(i in 1:length(weighted_characteristic$date)){
+    
+    weighted_subset <- weighting(
+      fx_factor %>% filter(date == weighted_characteristic$date[i]),
+      weighting_function = "demeaned_relative_rank" #Note: set this as global parameter later on
+      ) #choose from demeaned_relative_signal and demeaned_relative_rank
+    
+    characteristic = sum(weighted_subset$characteristic * weighted_subset$weight)
+    
+    weighted_characteristic$characteristic[i] <- characteristic
+  }
+  
+  return(weighted_characteristic)
+}
+```
+
+Now we loop through the different characteristics.
+```{r}
+factor_portfolios <- data.frame(date = unique(fx_factors$date))
+
+for(i in 4:ncol(fx_factors)){
+  
+  factor_portfolio <- single_factor(fx_factor = fx_factors[,c(1:3,i)])
+  
+  colnames(factor_portfolio)[2] <- colnames(fx_factors)[i]
+  
+  factor_portfolios <- left_join(x = factor_portfolios,
+                                 y = factor_portfolio,
+                                 by = "date")
+}
+rm(factor_portfolio, i)
+```
+
+We use this function for creating diagnostic plots.
+```{r}
+diagnostic_plot <- function(currency, lm){
+  
+  # Set up PNG output
+  png(filename = paste0("regression_diagnostics_", currency, ".png"), width = 2400, height = 1600)
+  
+  # Adjust layout for 2x3 grid (4 diagnostic plots + summary text)
+  par(mfrow = c(2, 3), mar = c(4, 4, 2, 1)) # 2 rows, 3 columns, adjust margins
+  
+  # Plot diagnostic plots (Residuals, Q-Q, Scale-Location, Cook's Distance)
+  plot(reduced_model, which = 1) # 1: Residuals vs Fitted
+  plot(reduced_model, which = 2) # 2: Normal Q-Q
+  plot(reduced_model, which = 3) # 3: Scale-Location
+  plot(reduced_model, which = 4) # 4: Cook's Distance
+  
+  # Add model summary as a text plot
+  summary_text <- capture.output(summary(reduced_model)) # Capture summary output as text
+  plot.new()                                             # Start a new plot
+  title(main = currency)                                 # Add heading with currency name
+  text(0, 1, paste(summary_text, collapse = "\n"), adj = 0, cex = 2) # Add summary
+  
+  # Close PNG device
+  dev.off()
+  
+  cat("Saved diagnostic plots and summary for", currency, "to PNG.\n")
+}
+```
+
+Classic ML style, I want to save some testing data for later.
+```{r}
+training_data <- factor_portfolios %>%
+  filter(date <= date_end_of_training) %>%
+  select(date, everything(), -matches("\\.cum$"))
+
+testing_data <- factor_portfolios %>%
+  filter(date > date_end_of_training) %>%
+  select(date, everything(), -matches("\\.cum$"))
+
+AIC_currency_specific_models <- list()
+for(i in 1:length(unique(fx_factors$Currency))){
+
+  merged_data <- inner_join(x = training_data,
+                         y = fx_factors %>%
+                           filter(Currency == unique(fx_factors$Currency)[i]) %>%
+                           select("date", "log_return"),
+                         by = "date")
+
+  #use stepwise AIC for feature selection
+  full_model <- lm(log_return ~ ., data = merged_data %>% select(-date)) #this is currency specific
+
+  reduced_model <- MASS::stepAIC(full_model, direction = "both", trace = FALSE)
+  AIC_currency_specific_models[[unique(fx_factors$Currency)[i]]] <- reduced_model
+  diagnostic_plot(unique(fx_factors$Currency)[i], reduced_model)
+}
+rm(i, merged_data, full_model, reduced_model)
+
+#Note: I may want to exclude currencies which have a low R^2 (set a global parameter for that)
+```
+
+Now we want to do predictions. We use the factors requested for each currency as input and get outputs as returns for the following months. This is our expected return.
+```{r}
+currency_predictions <- list()
+for (current_currency in names(AIC_currency_specific_models)) {
+  
+  current_model <- AIC_currency_specific_models[[current_currency]]
+  
+  merged_test_data <- inner_join(
+    x = testing_data,
+    y = fx_factors %>%
+      filter(Currency == current_currency) %>%
+      select("date", "log_return"),
+    by = "date"
+  )
+  
+  #ensure the predictors in the test set match those used in the model
+  test_features <- merged_test_data %>% 
+    select(all_of(names(current_model$coefficients)[-1]))  #exclude the intercept
+  
+  currency_predictions[[current_currency]] <- data.frame(
+    date = merged_test_data$date,
+    predicted_log_return = predict(current_model, newdata = test_features)
+  )
+}
+rm(current_currency, current_model, merged_test_data, test_features)
+
+all_predictions <- bind_rows(
+  lapply(names(currency_predictions), function(currency) {
+    currency_predictions[[currency]] %>%
+      mutate(Currency = currency)  #add currency identifier
+    }
+  )
+)
+rm(currency_predictions)
+
+rownames(all_predictions) <- NULL #idk why I need that but I also don't care
+
+head(all_predictions)
+```
+We try out how well this works compared to the testing data.
+```{r}
+all_predictions <- fx_factors %>%
+  select(date, Currency, log_return) %>%
+  filter(date > date_end_of_training) %>%
+  left_join(all_predictions, by = c("date", "Currency")) %>%
+  mutate(abs_prediction_error = log_return - predicted_log_return,
+         rel_prediction_error = log_return / predicted_log_return - 1) %>%
+  arrange(desc(date))
+
+#we build the final portfolio as the predicted top number_of_currencies currencies at each date
+final_portfolio <- all_predictions %>%
+  group_by(date) %>%
+  slice_max(order_by = predicted_log_return, n = number_of_currencies, with_ties = FALSE) %>%  
+  ungroup() %>%
+  arrange(desc(date))
+
+head(final_portfolio, 50)
+```
+Plot my portfolios returns out of sample
+```{r}
+cumulative_returns <- final_portfolio %>%
+  group_by(date) %>%
+  summarize(summed_log_return = sum(1/number_of_currencies * log_return, na.rm = TRUE)) %>%  #1/n weighted sum
+  mutate(cumulative_log_return = cumsum(summed_log_return))
+
+ggplot(cumulative_returns, aes(x = date, y = cumulative_log_return)) +
+  geom_line(color = "blue", linewidth = 1) +  #use linewidth for line thickness
+  scale_x_date(
+    breaks = c(min(cumulative_returns$date), max(cumulative_returns$date)),  #start and end dates
+    labels = scales::date_format("%Y-%m-%d")  #format dates as "YYYY-MM-DD"
+  ) +
+  labs(
+    title = "Cumulative Log Returns Over Time",
+    x = "Date",
+    y = "Cumulative Log Return"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+rm(cumulative_returns)
+```
